@@ -1,0 +1,52 @@
+[package]
+name = "ill-allow-it"
+version = "0.1.0"
+edition = "2024"
+description = "macOS menu bar app that auto-approves/denies Claude Code permission prompts"
+
+[dependencies]
+# macOS framework bindings
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString", "NSArray", "NSDictionary", "NSThread",
+    "NSRunLoop", "NSTimer", "NSNotification", "NSObject",
+    "NSProcessInfo",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication", "NSStatusBar", "NSStatusItem",
+    "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSImage",
+    "NSEvent", "NSRunningApplication", "NSWorkspace",
+    "NSAlert", "NSWindow",
+] }
+block2 = "0.6"
+
+# Accessibility API
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+
+# Keystroke injection
+core-graphics = "0.24"
+
+# Process discovery
+sysinfo = "0.33"
+
+# Configuration
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Pattern matching
+regex = "1"
+
+# Directory paths
+dirs = "6"
+
+# Error handling
+anyhow = "1"
+
+[profile.release]
+strip = true
+lto = true
