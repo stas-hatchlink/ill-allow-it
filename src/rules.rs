@@ -1,5 +1,5 @@
 use crate::config::{Config, Rule};
-use crate::types::{ApprovalAction, DetectedPrompt};
+use crate::types::{ApprovalAction, DetectedPrompt, PromptSource};
 
 /// Evaluate the rules against a detected prompt. First match wins.
 pub fn evaluate_rules(config: &Config, prompt: &DetectedPrompt) -> (ApprovalAction, Option<String>) {
@@ -13,7 +13,7 @@ pub fn evaluate_rules(config: &Config, prompt: &DetectedPrompt) -> (ApprovalActi
         .unwrap_or("");
 
     for rule in &config.rules {
-        if matches_rule(rule, tool_name, tool_detail) {
+        if matches_rule(rule, prompt.source, tool_name, tool_detail) {
             let action = parse_action(&rule.action);
             return (action, Some(rule.name.clone()));
         }
@@ -24,7 +24,19 @@ pub fn evaluate_rules(config: &Config, prompt: &DetectedPrompt) -> (ApprovalActi
     (default, None)
 }
 
-fn matches_rule(rule: &Rule, tool_name: &str, tool_detail: &str) -> bool {
+fn matches_rule(rule: &Rule, source: PromptSource, tool_name: &str, tool_detail: &str) -> bool {
+    // Check source filter if specified
+    if let Some(ref rule_source) = rule.source {
+        let expected = match rule_source.as_str() {
+            "claude_code" => PromptSource::ClaudeCode,
+            "vscode" => PromptSource::Vscode,
+            _ => return false, // Unknown source, skip rule
+        };
+        if source != expected {
+            return false;
+        }
+    }
+
     // Check tool name match (normalize spaces: "Web Search" == "WebSearch")
     if rule.tool != "*" {
         let rule_normalized = rule.tool.replace(' ', "").to_ascii_lowercase();
@@ -109,28 +121,58 @@ mod tests {
     fn test_matches_rule() {
         let rule = Rule {
             name: "test".to_string(),
+            source: None,
             tool: "Bash".to_string(),
             pattern: Some("git status*".to_string()),
             action: "approve".to_string(),
         };
 
-        assert!(matches_rule(&rule, "Bash", "git status"));
-        assert!(matches_rule(&rule, "Bash", "git status --short"));
-        assert!(!matches_rule(&rule, "Bash", "git push"));
-        assert!(!matches_rule(&rule, "Edit", "git status"));
+        assert!(matches_rule(&rule, PromptSource::ClaudeCode, "Bash", "git status"));
+        assert!(matches_rule(&rule, PromptSource::ClaudeCode, "Bash", "git status --short"));
+        assert!(!matches_rule(&rule, PromptSource::ClaudeCode, "Bash", "git push"));
+        assert!(!matches_rule(&rule, PromptSource::ClaudeCode, "Edit", "git status"));
     }
 
     #[test]
     fn test_wildcard_tool() {
         let rule = Rule {
             name: "test".to_string(),
+            source: None,
             tool: "*".to_string(),
             pattern: None,
             action: "approve".to_string(),
         };
 
-        assert!(matches_rule(&rule, "Bash", "anything"));
-        assert!(matches_rule(&rule, "Read", "anything"));
-        assert!(matches_rule(&rule, "Edit", "anything"));
+        assert!(matches_rule(&rule, PromptSource::ClaudeCode, "Bash", "anything"));
+        assert!(matches_rule(&rule, PromptSource::ClaudeCode, "Read", "anything"));
+        assert!(matches_rule(&rule, PromptSource::Vscode, "Edit", "anything"));
+    }
+
+    #[test]
+    fn test_source_filter() {
+        let vscode_rule = Rule {
+            name: "test".to_string(),
+            source: Some("vscode".to_string()),
+            tool: "WorkspaceTrust".to_string(),
+            pattern: None,
+            action: "approve".to_string(),
+        };
+
+        // Should match VSCode source
+        assert!(matches_rule(&vscode_rule, PromptSource::Vscode, "WorkspaceTrust", ""));
+        // Should NOT match Claude Code source
+        assert!(!matches_rule(&vscode_rule, PromptSource::ClaudeCode, "WorkspaceTrust", ""));
+
+        let no_source_rule = Rule {
+            name: "test".to_string(),
+            source: None,
+            tool: "Read".to_string(),
+            pattern: None,
+            action: "approve".to_string(),
+        };
+
+        // No source filter should match any source
+        assert!(matches_rule(&no_source_rule, PromptSource::ClaudeCode, "Read", ""));
+        assert!(matches_rule(&no_source_rule, PromptSource::Vscode, "Read", ""));
     }
 }

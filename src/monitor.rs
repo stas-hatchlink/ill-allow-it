@@ -1,45 +1,35 @@
 use crate::accessibility;
 use crate::config::Config;
-use crate::keystroke;
-use crate::process::{self, ClaudeProcess};
+use crate::process;
 use crate::rules;
-use crate::types::{ActionLogEntry, ApprovalAction, DetectedPrompt};
+use crate::types::{ActionLogEntry, ApprovalAction, DetectedPrompt, PromptSource};
 use regex::Regex;
 use std::collections::HashMap;
 use std::time::{Instant, SystemTime};
 use sysinfo::System;
 
+/// Button titles we look for to detect permission prompts.
+const APPROVE_BUTTONS: &[&str] = &["Allow once", "Allow Once", "Always allow for session"];
+const DENY_BUTTONS: &[&str] = &["Deny"];
+
+/// Button titles for VSCode workspace trust.
+const TRUST_BUTTONS: &[&str] = &["Yes, I trust the authors", "I trust the authors", "Trust"];
+
 pub struct Monitor {
     system: System,
     config: Config,
-    /// Prompts we've already acted on, keyed by claude PID.
-    /// Cleared when the prompt is no longer detected.
+    /// Prompts we've already acted on, keyed by target PID.
     known_prompts: HashMap<u32, Instant>,
     /// Recent action log for display in the menu
     pub action_log: Vec<ActionLogEntry>,
-    /// Regex for detecting permission prompts
-    prompt_regex: Regex,
-    /// Regex for extracting tool name
+    /// Regex for extracting tool name from prompt text
     tool_regex: Regex,
 }
 
 impl Monitor {
     pub fn new(config: Config) -> Self {
-        // Pattern to detect Claude Code permission prompts.
-        // Actual format: "Allow Claude to Read ..?" / "Allow Claude to Web Search?"
-        // with buttons "Allow once", "Always allow for session", "Deny"
-        let prompt_regex = Regex::new(
-            r"(?si)Allow Claude to .+\?.*(?:Allow once|Deny)"
-        ).expect("invalid prompt regex");
-
-        // Pattern to extract tool name from the permission prompt.
-        // Actual format: "Allow Claude to <ToolName> [detail]?"
-        // e.g. "Allow Claude to Read 25-26 Cyber Policy.PDF?"
-        //      "Allow Claude to Web Search?"
-        //      "Allow Claude to Bash?"
-        //      "Allow Claude to Edit src/main.rs?"
         let tool_regex = Regex::new(
-            r"(?i)Allow Claude to (Read|Write|Edit|Bash|Glob|Grep|WebFetch|Web Search|WebSearch|Agent|TodoWrite|NotebookEdit|mcp\S+)"
+            r"(?i)Allow Claude to (Read|Write|Edit|Run|Bash|Glob|Grep|WebFetch|Web Search|WebSearch|Agent|TodoWrite|NotebookEdit|mcp\S+)"
         ).expect("invalid tool regex");
 
         Monitor {
@@ -47,7 +37,6 @@ impl Monitor {
             config,
             known_prompts: HashMap::new(),
             action_log: Vec::new(),
-            prompt_regex,
             tool_regex,
         }
     }
@@ -62,34 +51,73 @@ impl Monitor {
             return 0;
         }
 
-        let processes = process::find_claude_processes(&mut self.system);
         let mut actions_taken = 0;
         let mut still_active: Vec<u32> = Vec::new();
 
-        for proc in &processes {
-            match self.check_process(proc) {
+        // Path 1: Claude Code processes - find them and scan their parent app windows
+        let claude_processes = process::find_claude_processes(&mut self.system);
+        if !claude_processes.is_empty() {
+            log::debug!("Found {} Claude process(es)", claude_processes.len());
+        }
+
+        // Deduplicate by parent PID (multiple claude processes may share one parent)
+        let mut seen_parents: Vec<u32> = Vec::new();
+        for proc in &claude_processes {
+            if seen_parents.contains(&proc.parent_app_pid) {
+                still_active.push(proc.parent_app_pid);
+                continue;
+            }
+            seen_parents.push(proc.parent_app_pid);
+
+            log::debug!(
+                "Scanning parent app {} (PID {}) for Claude PID {}",
+                proc.parent_app_name, proc.parent_app_pid, proc.pid
+            );
+
+            match self.check_for_claude_prompt(proc.parent_app_pid, &proc.parent_app_name) {
                 Ok(Some(entry)) => {
                     log::info!("Action: {}", entry);
                     self.action_log.push(entry);
-                    // Keep only last 50 entries
-                    if self.action_log.len() > 50 {
-                        self.action_log.remove(0);
-                    }
                     actions_taken += 1;
                 }
-                Ok(None) => {
-                    // No prompt detected or already handled
-                }
+                Ok(None) => {}
                 Err(e) => {
-                    log::debug!(
-                        "Error checking process {} (parent {}): {}",
-                        proc.pid,
-                        proc.parent_app_name,
-                        e
+                    log::warn!(
+                        "Error scanning {} (PID {}): {}",
+                        proc.parent_app_name, proc.parent_app_pid, e
                     );
                 }
             }
-            still_active.push(proc.pid);
+            still_active.push(proc.parent_app_pid);
+        }
+
+        // Path 2: VSCode windows - scan for workspace trust and extension prompts
+        if self.config.vscode_enabled {
+            let vscode_processes = process::find_vscode_processes(&mut self.system);
+            for app in &vscode_processes {
+                if seen_parents.contains(&app.pid) {
+                    still_active.push(app.pid);
+                    continue;
+                }
+
+                match self.check_for_vscode_prompt(app.pid, &app.app_name) {
+                    Ok(Some(entry)) => {
+                        log::info!("Action: {}", entry);
+                        self.action_log.push(entry);
+                        actions_taken += 1;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        log::debug!("Error scanning VSCode (PID {}): {}", app.pid, e);
+                    }
+                }
+                still_active.push(app.pid);
+            }
+        }
+
+        // Keep only last 50 entries
+        if self.action_log.len() > 50 {
+            self.action_log.drain(0..self.action_log.len() - 50);
         }
 
         // Clean up prompts for processes that no longer exist
@@ -99,74 +127,140 @@ impl Monitor {
         actions_taken
     }
 
-    fn check_process(&mut self, proc: &ClaudeProcess) -> anyhow::Result<Option<ActionLogEntry>> {
-        // Read the window text from the parent GUI app
-        let text = accessibility::read_window_text(proc.parent_app_pid as i32)?;
-
-        // Check if there's a permission prompt
-        if !self.prompt_regex.is_match(&text) {
-            // No prompt — clear any known prompt for this PID
-            self.known_prompts.remove(&proc.pid);
-            return Ok(None);
-        }
-
-        // We found a prompt. Check if we already acted on it.
-        if let Some(last_seen) = self.known_prompts.get(&proc.pid) {
-            // If we saw this less than 3 seconds ago, skip it.
-            // This prevents double-acting on the same prompt.
+    /// Scan an app's windows for Claude permission prompt buttons and click them.
+    fn check_for_claude_prompt(&mut self, pid: u32, app_name: &str) -> anyhow::Result<Option<ActionLogEntry>> {
+        // Dedup check
+        if let Some(last_seen) = self.known_prompts.get(&pid) {
             if last_seen.elapsed().as_secs() < 3 {
                 return Ok(None);
             }
         }
 
-        // Parse out the tool name and detail
-        let prompt = self.parse_prompt(&text, proc);
+        let scan = accessibility::scan_app_windows(pid as i32)?;
 
-        // Evaluate rules
-        let (action, rule_name) = rules::evaluate_rules(&self.config, &prompt);
+        if !scan.buttons.is_empty() {
+            log::debug!(
+                "Buttons in {} (PID {}): {:?}",
+                app_name, pid,
+                scan.buttons.iter().map(|b| &b.title).collect::<Vec<_>>()
+            );
+        }
 
-        if action == ApprovalAction::Ignore {
-            // Don't send anything, don't mark as handled
+        // Look for "Allow once" or "Always allow for session" buttons
+        let approve_button = scan.buttons.iter().find(|b| {
+            APPROVE_BUTTONS.iter().any(|&target| b.title.contains(target))
+        });
+        let deny_button = scan.buttons.iter().find(|b| {
+            DENY_BUTTONS.iter().any(|&target| b.title == target)
+        });
+
+        // Must have both an approve and deny button to confirm it's a permission prompt
+        if approve_button.is_none() || deny_button.is_none() {
+            self.known_prompts.remove(&pid);
             return Ok(None);
         }
 
-        // Send the keystroke
-        keystroke::send_keystroke(proc.parent_app_pid as i32, action)?;
+        // Extract tool name from the window text
+        let all_text = scan.texts.join("\n");
+        let tool_name = self.tool_regex
+            .captures(&all_text)
+            .map(|caps| caps.get(1).unwrap().as_str().to_string());
+        let tool_detail = extract_detail(&all_text);
 
-        // Mark this prompt as handled
-        self.known_prompts.insert(proc.pid, Instant::now());
+        log::info!(
+            "Permission prompt detected in {} (PID {}): tool={:?} detail={:?}",
+            app_name, pid, tool_name, tool_detail
+        );
 
-        let entry = ActionLogEntry {
-            timestamp: SystemTime::now(),
-            tool_name: prompt.tool_name.unwrap_or_else(|| "Unknown".to_string()),
-            tool_detail: prompt.tool_detail.unwrap_or_default(),
-            action,
-            rule_name,
+        // Build prompt for rule evaluation
+        let prompt = DetectedPrompt {
+            source: PromptSource::ClaudeCode,
+            target_pid: pid,
+            app_name: app_name.to_string(),
+            prompt_text: all_text,
+            tool_name: tool_name.clone(),
+            tool_detail: tool_detail.clone(),
+            detected_at: Instant::now(),
         };
 
-        Ok(Some(entry))
+        let (action, rule_name) = rules::evaluate_rules(&self.config, &prompt);
+
+        if action == ApprovalAction::Ignore {
+            return Ok(None);
+        }
+
+        // Click the appropriate button
+        let button_to_click = match action {
+            ApprovalAction::Approve | ApprovalAction::ApproveAlways => approve_button.unwrap(),
+            ApprovalAction::Deny => deny_button.unwrap(),
+            ApprovalAction::Ignore => return Ok(None),
+        };
+
+        log::info!("Clicking button: {:?} in {} (PID {})", button_to_click.title, app_name, pid);
+        accessibility::click_button(button_to_click)?;
+
+        self.known_prompts.insert(pid, Instant::now());
+
+        Ok(Some(ActionLogEntry {
+            timestamp: SystemTime::now(),
+            source: PromptSource::ClaudeCode,
+            tool_name: tool_name.unwrap_or_else(|| "Unknown".to_string()),
+            tool_detail: tool_detail.unwrap_or_default(),
+            action,
+            rule_name,
+        }))
     }
 
-    fn parse_prompt(&self, text: &str, proc: &ClaudeProcess) -> DetectedPrompt {
-        let tool_name = self
-            .tool_regex
-            .captures(text)
-            .map(|caps| caps.get(1).unwrap().as_str().to_string());
-
-        // Extract detail: everything between the tool name and the "?"
-        // e.g. "Allow Claude to Read 25-26 Cyber Policy.PDF?" -> "25-26 Cyber Policy.PDF"
-        // Also check for file paths on separate lines
-        let tool_detail = extract_detail(text);
-
-        DetectedPrompt {
-            claude_pid: proc.pid,
-            parent_app_pid: proc.parent_app_pid,
-            parent_app_name: proc.parent_app_name.clone(),
-            prompt_text: text.to_string(),
-            tool_name,
-            tool_detail,
-            detected_at: Instant::now(),
+    /// Scan VSCode windows for trust dialogs or extension prompts.
+    fn check_for_vscode_prompt(&mut self, pid: u32, app_name: &str) -> anyhow::Result<Option<ActionLogEntry>> {
+        if let Some(last_seen) = self.known_prompts.get(&pid) {
+            if last_seen.elapsed().as_secs() < 3 {
+                return Ok(None);
+            }
         }
+
+        let scan = accessibility::scan_app_windows(pid as i32)?;
+
+        // Look for workspace trust buttons
+        let trust_button = scan.buttons.iter().find(|b| {
+            TRUST_BUTTONS.iter().any(|&target| b.title.contains(target))
+        });
+
+        if let Some(button) = trust_button {
+            let prompt = DetectedPrompt {
+                source: PromptSource::Vscode,
+                target_pid: pid,
+                app_name: app_name.to_string(),
+                prompt_text: String::new(),
+                tool_name: Some("WorkspaceTrust".to_string()),
+                tool_detail: None,
+                detected_at: Instant::now(),
+            };
+
+            let (action, rule_name) = rules::evaluate_rules(&self.config, &prompt);
+            if action == ApprovalAction::Ignore {
+                return Ok(None);
+            }
+
+            if matches!(action, ApprovalAction::Approve | ApprovalAction::ApproveAlways) {
+                log::info!("Clicking trust button: {:?} in VSCode (PID {})", button.title, pid);
+                accessibility::click_button(button)?;
+            }
+
+            self.known_prompts.insert(pid, Instant::now());
+
+            return Ok(Some(ActionLogEntry {
+                timestamp: SystemTime::now(),
+                source: PromptSource::Vscode,
+                tool_name: "WorkspaceTrust".to_string(),
+                tool_detail: String::new(),
+                action,
+                rule_name,
+            }));
+        }
+
+        self.known_prompts.remove(&pid);
+        Ok(None)
     }
 
     pub fn process_count(&mut self) -> usize {
@@ -175,12 +269,10 @@ impl Monitor {
     }
 }
 
-/// Extract detail from permission prompt text.
+/// Extract detail from Claude Code permission prompt text.
 fn extract_detail(text: &str) -> Option<String> {
-    // Pattern 1: "Allow Claude to ToolName DETAIL?"
-    // e.g. "Allow Claude to Read 25-26 Cyber Policy.PDF?"
     let detail_re = Regex::new(
-        r"(?i)Allow Claude to (?:Read|Write|Edit|Bash|Glob|Grep|WebFetch|Web Search|WebSearch|Agent|TodoWrite|NotebookEdit|mcp\S+)\s+(.+?)\?"
+        r"(?i)Allow Claude to (?:Read|Write|Edit|Run|Bash|Glob|Grep|WebFetch|Web Search|WebSearch|Agent|TodoWrite|NotebookEdit|mcp\S+)\s+(.+?)\?"
     ).ok()?;
     if let Some(caps) = detail_re.captures(text) {
         let detail = caps.get(1)?.as_str().trim().to_string();
@@ -189,13 +281,11 @@ fn extract_detail(text: &str) -> Option<String> {
         }
     }
 
-    // Pattern 2: File paths on their own line (e.g. /Users/stas/Downloads/file.pdf)
     let path_re = Regex::new(r"(/[^\s]+(?:\s[^\s/]+)*\.\w+)").ok()?;
     if let Some(caps) = path_re.captures(text) {
         return Some(caps.get(1)?.as_str().to_string());
     }
 
-    // Pattern 3: backtick-quoted content
     let backtick_re = Regex::new(r"`([^`]+)`").ok()?;
     if let Some(caps) = backtick_re.captures(text) {
         return Some(caps.get(1)?.as_str().to_string());

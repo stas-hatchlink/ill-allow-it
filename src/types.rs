@@ -1,5 +1,22 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::{Instant, SystemTime};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSource {
+    ClaudeCode,
+    Vscode,
+}
+
+impl fmt::Display for PromptSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PromptSource::ClaudeCode => write!(f, "claude_code"),
+            PromptSource::Vscode => write!(f, "vscode"),
+        }
+    }
+}
 
 /// macOS virtual keycodes
 pub const KEYCODE_RETURN: u16 = 0x24; // Enter/Return
@@ -47,17 +64,17 @@ impl ApprovalAction {
 
 #[derive(Debug, Clone)]
 pub struct DetectedPrompt {
-    /// PID of the `claude` process
-    pub claude_pid: u32,
-    /// PID of the parent GUI application (Terminal.app, Claude.app, etc.)
-    pub parent_app_pid: u32,
-    /// Name of the parent application
-    pub parent_app_name: String,
+    /// Where this prompt originated from
+    pub source: PromptSource,
+    /// PID of the application displaying the prompt (we send keystrokes here)
+    pub target_pid: u32,
+    /// Name of the application
+    pub app_name: String,
     /// The full text of the permission prompt
     pub prompt_text: String,
-    /// Parsed tool name (e.g., "Bash", "Edit", "Write", "Read")
+    /// Parsed tool name (e.g., "Bash", "Edit", "WorkspaceTrust", "ClaudeExtension")
     pub tool_name: Option<String>,
-    /// Parsed detail (e.g., the command or file path)
+    /// Parsed detail (e.g., the command, file path, workspace path)
     pub tool_detail: Option<String>,
     /// When we first detected this prompt
     pub detected_at: Instant,
@@ -66,6 +83,7 @@ pub struct DetectedPrompt {
 #[derive(Debug, Clone)]
 pub struct ActionLogEntry {
     pub timestamp: SystemTime,
+    pub source: PromptSource,
     pub tool_name: String,
     pub tool_detail: String,
     pub action: ApprovalAction,
@@ -79,6 +97,6 @@ impl fmt::Display for ActionLogEntry {
         } else {
             format!("{}({})", self.tool_name, self.tool_detail)
         };
-        write!(f, "{}: {}", self.action, tool)
+        write!(f, "[{}] {}: {}", self.source, self.action, tool)
     }
 }

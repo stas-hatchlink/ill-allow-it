@@ -102,6 +102,18 @@ define_class!(
                 .ok();
         }
 
+        #[unsafe(method(onToggleVscode:))]
+        fn on_toggle_vscode(&self, _sender: *mut NSObject) {
+            with_state(|state| {
+                if let Ok(mut cfg) = config::load_config() {
+                    cfg.vscode_enabled = !cfg.vscode_enabled;
+                    let _ = config::save_config(&cfg);
+                    state.monitor.update_config(cfg);
+                    log::info!("Toggled VSCode monitoring");
+                }
+            });
+        }
+
         #[unsafe(method(onReloadConfig:))]
         fn on_reload_config(&self, _sender: *mut NSObject) {
             with_state(|state| {
@@ -184,6 +196,7 @@ fn build_menu(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained<NSMenu>
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
     add_menu_item(&menu, mtm, "Enabled", Some(objc2::sel!(onToggleEnabled:)), Some(delegate_obj), true);
+    add_menu_item(&menu, mtm, "VSCode Prompts", Some(objc2::sel!(onToggleVscode:)), Some(delegate_obj), true);
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 

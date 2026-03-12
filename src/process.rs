@@ -98,6 +98,57 @@ fn find_parent_gui_app(system: &System, start_pid: u32) -> Option<(u32, String)>
     last_known
 }
 
+/// A detected GUI application window (for direct app scanning, e.g. VSCode).
+#[derive(Debug, Clone)]
+pub struct AppWindow {
+    pub pid: u32,
+    pub app_name: String,
+}
+
+/// Known VSCode-like process names
+const VSCODE_PROCESS_NAMES: &[&str] = &["Code", "Electron"];
+
+/// Find all running VSCode processes.
+/// Returns the main app process (not helper/renderer processes).
+pub fn find_vscode_processes(system: &mut System) -> Vec<AppWindow> {
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut results = Vec::new();
+
+    for (pid, process) in system.processes() {
+        let name = process.name().to_string_lossy().to_string();
+
+        // Skip helper processes - we want the main app process
+        if name.contains("Helper") || name.contains("GPU") || name.contains("Utility") {
+            continue;
+        }
+
+        let is_vscode = VSCODE_PROCESS_NAMES.iter().any(|&n| name == n);
+        if !is_vscode {
+            continue;
+        }
+
+        // For "Electron" processes, verify it's actually VSCode by checking args
+        if name == "Electron" {
+            let cmd: Vec<String> = process
+                .cmd()
+                .iter()
+                .map(|s| s.to_string_lossy().to_string())
+                .collect();
+            let cmd_str = cmd.join(" ");
+            if !cmd_str.contains("Visual Studio Code") && !cmd_str.contains("/code") {
+                continue;
+            }
+        }
+
+        results.push(AppWindow {
+            pid: pid.as_u32(),
+            app_name: name,
+        });
+    }
+
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +158,12 @@ mod tests {
         let mut system = System::new();
         let processes = find_claude_processes(&mut system);
         println!("Found {} Claude processes", processes.len());
+    }
+
+    #[test]
+    fn test_find_vscode_does_not_crash() {
+        let mut system = System::new();
+        let processes = find_vscode_processes(&mut system);
+        println!("Found {} VSCode processes", processes.len());
     }
 }

@@ -4,9 +4,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub vscode_enabled: bool,
     pub poll_interval_ms: u64,
     pub default_action: String,
     pub rules: Vec<Rule>,
@@ -16,7 +22,10 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub name: String,
-    /// Tool name to match: "Bash", "Edit", "Write", "Read", "WebFetch", "*" for any
+    /// Optional source filter: "claude_code", "vscode", or omitted to match any source
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Tool name to match: "Bash", "Edit", "Write", "Read", "WebFetch", "WorkspaceTrust", "*" for any
     pub tool: String,
     /// Glob pattern to match against the tool detail (command, file path, etc.)
     /// If omitted, matches any detail for the given tool.
@@ -30,62 +39,105 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             enabled: true,
+            vscode_enabled: true,
             poll_interval_ms: 500,
             default_action: "ignore".to_string(),
             rules: vec![
+                // Claude Code rules
+                // Using approve_always (Cmd+Enter) which works in both:
+                // - CLI: triggers "Always allow for session"
+                // - Desktop app: triggers "Allow once" (which requires Cmd+Enter)
                 Rule {
                     name: "Allow file reads".to_string(),
+                    source: None,
                     tool: "Read".to_string(),
                     pattern: None,
-                    action: "approve".to_string(),
+                    action: "approve_always".to_string(),
                 },
                 Rule {
                     name: "Allow glob searches".to_string(),
+                    source: None,
                     tool: "Glob".to_string(),
                     pattern: None,
-                    action: "approve".to_string(),
+                    action: "approve_always".to_string(),
                 },
                 Rule {
                     name: "Allow grep searches".to_string(),
+                    source: None,
                     tool: "Grep".to_string(),
                     pattern: None,
-                    action: "approve".to_string(),
+                    action: "approve_always".to_string(),
                 },
                 Rule {
                     name: "Allow web search".to_string(),
+                    source: None,
                     tool: "Web Search".to_string(),
                     pattern: None,
-                    action: "approve".to_string(),
+                    action: "approve_always".to_string(),
                 },
                 Rule {
                     name: "Allow web fetch".to_string(),
+                    source: None,
                     tool: "WebFetch".to_string(),
                     pattern: None,
-                    action: "approve".to_string(),
+                    action: "approve_always".to_string(),
                 },
                 Rule {
                     name: "Allow file edits".to_string(),
+                    source: None,
                     tool: "Edit".to_string(),
                     pattern: None,
-                    action: "approve".to_string(),
+                    action: "approve_always".to_string(),
                 },
                 Rule {
                     name: "Allow file writes".to_string(),
+                    source: None,
                     tool: "Write".to_string(),
                     pattern: None,
-                    action: "approve".to_string(),
+                    action: "approve_always".to_string(),
                 },
                 Rule {
                     name: "Deny git push".to_string(),
+                    source: None,
                     tool: "Bash".to_string(),
                     pattern: Some("git push*".to_string()),
                     action: "deny".to_string(),
                 },
                 Rule {
                     name: "Allow all Bash".to_string(),
+                    source: None,
                     tool: "Bash".to_string(),
                     pattern: None,
-                    action: "approve".to_string(),
+                    action: "approve_always".to_string(),
+                },
+                Rule {
+                    name: "Deny git push (Run)".to_string(),
+                    source: None,
+                    tool: "Run".to_string(),
+                    pattern: Some("*git push*".to_string()),
+                    action: "deny".to_string(),
+                },
+                Rule {
+                    name: "Allow all Run".to_string(),
+                    source: None,
+                    tool: "Run".to_string(),
+                    pattern: None,
+                    action: "approve_always".to_string(),
+                },
+                // VSCode rules
+                Rule {
+                    name: "Auto-trust VSCode workspaces".to_string(),
+                    source: Some("vscode".to_string()),
+                    tool: "WorkspaceTrust".to_string(),
+                    pattern: None,
+                    action: "approve_always".to_string(),
+                },
+                Rule {
+                    name: "Allow Claude VSCode extension prompts".to_string(),
+                    source: Some("vscode".to_string()),
+                    tool: "ClaudeExtension".to_string(),
+                    pattern: None,
+                    action: "approve_always".to_string(),
                 },
             ],
             log_actions: true,
