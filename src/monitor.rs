@@ -15,6 +15,9 @@ const DENY_BUTTONS: &[&str] = &["Deny"];
 /// Button titles for VSCode workspace trust.
 const TRUST_BUTTONS: &[&str] = &["Yes, I trust the authors", "I trust the authors", "Trust"];
 
+/// Button titles for macOS system notification permission banners.
+const NOTIFICATION_ALLOW_BUTTONS: &[&str] = &["Allow once", "Allow Once", "Allow"];
+
 pub struct Monitor {
     system: System,
     config: Config,
@@ -112,6 +115,26 @@ impl Monitor {
                     }
                 }
                 still_active.push(app.pid);
+            }
+        }
+
+        // Path 3: System notification permission banners (e.g. "Claude - Notification - Allow once")
+        let system_notif_processes = process::find_system_notification_processes(&mut self.system);
+        for app in &system_notif_processes {
+            if seen_parents.contains(&app.pid) {
+                continue;
+            }
+
+            match self.check_for_system_notification(app.pid, &app.app_name) {
+                Ok(Some(entry)) => {
+                    log::info!("Action: {}", entry);
+                    self.action_log.push(entry);
+                    actions_taken += 1;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    log::debug!("Error scanning {} (PID {}): {}", app.app_name, app.pid, e);
+                }
             }
         }
 
@@ -260,6 +283,57 @@ impl Monitor {
         }
 
         self.known_prompts.remove(&pid);
+        Ok(None)
+    }
+
+    /// Scan system notification processes for permission banners and click "Allow".
+    fn check_for_system_notification(&mut self, pid: u32, app_name: &str) -> anyhow::Result<Option<ActionLogEntry>> {
+        // Use a synthetic key for dedup: offset to avoid collision with real PIDs
+        let dedup_key = pid + 1_000_000;
+        if let Some(last_seen) = self.known_prompts.get(&dedup_key) {
+            if last_seen.elapsed().as_secs() < 3 {
+                return Ok(None);
+            }
+        }
+
+        let scan = accessibility::scan_app_windows(pid as i32)?;
+
+        // Look for notification "Allow once" / "Allow" buttons
+        let allow_button = scan.buttons.iter().find(|b| {
+            NOTIFICATION_ALLOW_BUTTONS.iter().any(|&target| b.title == target)
+        });
+
+        if let Some(button) = allow_button {
+            // Check if the text mentions a known app name to confirm it's a notification prompt
+            let all_text = scan.texts.join(" ");
+            let is_notification_prompt = all_text.contains("Notification")
+                || all_text.contains("notification");
+
+            if !is_notification_prompt {
+                return Ok(None);
+            }
+
+            log::info!(
+                "System notification permission detected in {} (PID {}): {:?}",
+                app_name, pid, all_text
+            );
+
+            log::info!("Clicking notification allow button: {:?}", button.title);
+            accessibility::click_button(button)?;
+
+            self.known_prompts.insert(dedup_key, Instant::now());
+
+            return Ok(Some(ActionLogEntry {
+                timestamp: SystemTime::now(),
+                source: PromptSource::ClaudeCode,
+                tool_name: "Notification".to_string(),
+                tool_detail: "System notification permission".to_string(),
+                action: ApprovalAction::Approve,
+                rule_name: Some("system-notification-allow".to_string()),
+            }));
+        }
+
+        self.known_prompts.remove(&dedup_key);
         Ok(None)
     }
 

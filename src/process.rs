@@ -105,6 +105,14 @@ pub struct AppWindow {
     pub app_name: String,
 }
 
+/// System processes that show notification/permission banners
+const SYSTEM_NOTIFICATION_PROCESSES: &[&str] = &[
+    "NotificationCenter",
+    "UserNotificationCenter",
+    "SystemUIServer",
+    "CoreServicesUIAgent",
+];
+
 /// Known VSCode-like process names
 const VSCODE_PROCESS_NAMES: &[&str] = &["Code", "Electron"];
 
@@ -138,6 +146,28 @@ pub fn find_vscode_processes(system: &mut System) -> Vec<AppWindow> {
             if !cmd_str.contains("Visual Studio Code") && !cmd_str.contains("/code") {
                 continue;
             }
+        }
+
+        results.push(AppWindow {
+            pid: pid.as_u32(),
+            app_name: name,
+        });
+    }
+
+    results
+}
+
+/// Find system processes that render notification/permission dialogs.
+pub fn find_system_notification_processes(system: &mut System) -> Vec<AppWindow> {
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut results = Vec::new();
+
+    for (pid, process) in system.processes() {
+        let name = process.name().to_string_lossy().to_string();
+
+        let is_system_notif = SYSTEM_NOTIFICATION_PROCESSES.iter().any(|&n| name == n);
+        if !is_system_notif {
+            continue;
         }
 
         results.push(AppWindow {
