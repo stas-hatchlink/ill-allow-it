@@ -5,8 +5,25 @@ use crate::rules;
 use crate::types::{ActionLogEntry, ApprovalAction, DetectedPrompt, PromptSource};
 use regex::Regex;
 use std::collections::HashMap;
+use std::io::Write;
 use std::time::{Instant, SystemTime};
 use sysinfo::System;
+
+/// Write a debug message to the log file
+fn debug_log(msg: &str) {
+    let log_path = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".ill-allow-it")
+        .join("debug.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let now = chrono::Local::now().format("%H:%M:%S%.3f");
+        let _ = writeln!(f, "[{}] {}", now, msg);
+    }
+}
 
 /// Button titles we look for to detect permission prompts.
 const APPROVE_BUTTONS: &[&str] = &["Allow once", "Allow Once", "Always allow for session"];
@@ -27,6 +44,8 @@ pub struct Monitor {
     pub action_log: Vec<ActionLogEntry>,
     /// Regex for extracting tool name from prompt text
     tool_regex: Regex,
+    /// Tick counter for periodic logging
+    tick_count: u64,
 }
 
 impl Monitor {
@@ -41,6 +60,7 @@ impl Monitor {
             known_prompts: HashMap::new(),
             action_log: Vec::new(),
             tool_regex,
+            tick_count: 0,
         }
     }
 
@@ -54,13 +74,19 @@ impl Monitor {
             return 0;
         }
 
+        self.tick_count += 1;
+        // Log a heartbeat every 60 ticks (~30 seconds)
+        if self.tick_count % 60 == 1 {
+            debug_log(&format!("Heartbeat: tick #{}, enabled={}", self.tick_count, self.config.enabled));
+        }
+
         let mut actions_taken = 0;
         let mut still_active: Vec<u32> = Vec::new();
 
         // Path 1: Claude Code processes - find them and scan their parent app windows
         let claude_processes = process::find_claude_processes(&mut self.system);
         if !claude_processes.is_empty() {
-            log::debug!("Found {} Claude process(es)", claude_processes.len());
+            debug_log(&format!("Found {} Claude process(es)", claude_processes.len()));
         }
 
         // Deduplicate by parent PID (multiple claude processes may share one parent)
@@ -161,12 +187,15 @@ impl Monitor {
 
         let scan = accessibility::scan_app_windows(pid as i32)?;
 
+        // Log all buttons found (useful for debugging what labels the app uses)
         if !scan.buttons.is_empty() {
-            log::debug!(
+            let btn_titles: Vec<&str> = scan.buttons.iter().map(|b| b.title.as_str()).collect();
+            debug_log(&format!(
                 "Buttons in {} (PID {}): {:?}",
-                app_name, pid,
-                scan.buttons.iter().map(|b| &b.title).collect::<Vec<_>>()
-            );
+                app_name, pid, btn_titles
+            ));
+        } else {
+            debug_log(&format!("No buttons in {} (PID {})", app_name, pid));
         }
 
         // Look for "Allow once" or "Always allow for session" buttons
@@ -176,6 +205,12 @@ impl Monitor {
         let deny_button = scan.buttons.iter().find(|b| {
             DENY_BUTTONS.iter().any(|&target| b.title == target)
         });
+
+        debug_log(&format!(
+            "approve_button={:?}, deny_button={:?}",
+            approve_button.map(|b| &b.title),
+            deny_button.map(|b| &b.title),
+        ));
 
         // Must have both an approve and deny button to confirm it's a permission prompt
         if approve_button.is_none() || deny_button.is_none() {
