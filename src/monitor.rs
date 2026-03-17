@@ -77,7 +77,14 @@ impl Monitor {
         self.tick_count += 1;
         // Log a heartbeat every 60 ticks (~30 seconds)
         if self.tick_count % 60 == 1 {
-            debug_log(&format!("Heartbeat: tick #{}, enabled={}", self.tick_count, self.config.enabled));
+            let trusted = crate::accessibility::is_accessibility_trusted();
+            debug_log(&format!(
+                "Heartbeat: tick #{}, enabled={}, accessibility_trusted={}",
+                self.tick_count, self.config.enabled, trusted
+            ));
+            if !trusted {
+                debug_log("WARNING: Accessibility not trusted! Re-grant permission in System Settings.");
+            }
         }
 
         let mut actions_taken = 0;
